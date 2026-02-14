@@ -1,4 +1,8 @@
-# How to use this mess
+# How to use
+
+> UI inspired by [keilerkonzept/sliding-topk-tui-demo](https://github.com/keilerkonzept/sliding-topk-tui-demo)
+>
+> Sample data from [Web Server Access Logs](https://www.kaggle.com/datasets/eliasdabbas/web-server-access-logs) on Kaggle
 
 ## 1. Build
 
@@ -28,4 +32,3 @@ go build -mod=vendor -o .\experiment.exe .\program
 | `t` / `Space` | Track selected item |
 | `s` | Toggle log / linear scale |
 | `q` / `Ctrl+C` | Quit |
-
