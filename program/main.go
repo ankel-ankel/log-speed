@@ -101,7 +101,7 @@ var config = Config{
 }
 
 var (
-	selectedColor = styles.AdaptiveColor{Light: "0", Dark: "14"}
+	selectedColor = styles.AdaptiveColor{Light: "0", Dark: "9"}
 	borderColor   = styles.AdaptiveColor{Light: "#555", Dark: "#555"}
 	selectedFg    = styles.NewStyle().Foreground(selectedColor)
 	borderFg      = styles.NewStyle().Foreground(borderColor)
@@ -837,7 +837,7 @@ func (m *model) updatePlot(_ tui.Msg) tui.Cmd {
 
 	var highlight, dim plot.Color
 	if styles.DefaultRenderer().HasDarkBackground() {
-		highlight, dim = plot.Cyan, plot.DimGray
+		highlight, dim = plot.Red, plot.DimGray
 	} else {
 		highlight, dim = plot.Black, plot.LightGray
 	}
@@ -1022,7 +1022,7 @@ func (m *model) View() string {
 	}
 
 	if len(statsBlock) != 0 {
-		statsStyle := styles.NewStyle().Foreground(styles.AdaptiveColor{Light: "4", Dark: "12"})
+		statsStyle := styles.NewStyle().Foreground(styles.AdaptiveColor{Light: "1", Dark: "9"})
 		statsText := strings.Join(statsBlock, "\n")
 		return styles.JoinVertical(styles.Left, view, statsStyle.Render(statsText), m.help.View(keys))
 	}
