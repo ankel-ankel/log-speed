@@ -1,4 +1,4 @@
-# How to use
+# How to use this mess
 
 > UI inspired by [keilerkonzept/sliding-topk-tui-demo](https://github.com/keilerkonzept/sliding-topk-tui-demo)
 >
