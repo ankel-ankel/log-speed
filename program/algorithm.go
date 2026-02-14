@@ -33,10 +33,6 @@ func NewIncrementalRanker(k int, fullRefresh time.Duration, partialSize int) *In
 	}
 }
 
-// Refresh updates the view of the top-K items.
-// Provide two functions that are safe to call while holding any shared locks:
-// - sortedFn: returns a full Top-K view (approximate, from the sketch)
-// - updateCountsFn: updates Count fields for the first `limit` items in-place
 func (r *IncrementalRanker) Refresh(now time.Time, visibleItems int, sortedFn func() []heap.Item, updateCountsFn func(items []heap.Item, limit int)) (items []heap.Item, didFull bool) {
 	if now.IsZero() {
 		now = time.Now()
