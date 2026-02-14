@@ -1,28 +1,30 @@
 package main
 
 import (
+	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type durationRing struct {
-	buf   []time.Duration
+type int64Ring struct {
+	buf   []int64
 	idx   int
 	count int
 }
 
-func newDurationRing(n int) *durationRing {
+func newInt64Ring(n int) *int64Ring {
 	if n < 1 {
 		n = 1
 	}
-	return &durationRing{buf: make([]time.Duration, n)}
+	return &int64Ring{buf: make([]int64, n)}
 }
 
-func (r *durationRing) add(d time.Duration) {
+func (r *int64Ring) add(v int64) {
 	if len(r.buf) == 0 {
 		return
 	}
-	r.buf[r.idx] = d
+	r.buf[r.idx] = v
 	r.idx++
 	if r.idx >= len(r.buf) {
 		r.idx = 0
@@ -32,59 +34,40 @@ func (r *durationRing) add(d time.Duration) {
 	}
 }
 
-type durationStats struct {
-	last time.Duration
-	max  time.Duration
-	avg  time.Duration
-	n    int
-}
-
-func (r *durationRing) snapshot() durationStats {
+func (r *int64Ring) snapshot() (oldest, newest int64, n int) {
 	if r.count == 0 {
-		return durationStats{}
+		return 0, 0, 0
 	}
-	var sum time.Duration
-	var max time.Duration
-	for i := 0; i < r.count; i++ {
-		d := r.buf[i]
-		sum += d
-		if d > max {
-			max = d
-		}
+	newestIdx := r.idx - 1
+	if newestIdx < 0 {
+		newestIdx = len(r.buf) - 1
 	}
-
-	lastIdx := r.idx - 1
-	if lastIdx < 0 {
-		lastIdx = len(r.buf) - 1
+	oldestIdx := 0
+	if r.count == len(r.buf) {
+		oldestIdx = r.idx
 	}
-	last := r.buf[lastIdx]
-
-	return durationStats{
-		last: last,
-		max:  max,
-		avg:  sum / time.Duration(r.count),
-		n:    r.count,
-	}
+	return r.buf[oldestIdx], r.buf[newestIdx], r.count
 }
 
 type latencyMetrics struct {
 	enabled atomic.Bool
 
-	startedNs       atomic.Int64
 	ingestedRecords atomic.Uint64
-	firstIngestNs   atomic.Int64
 	lastIngestNs    atomic.Int64
 
-	topkAny       *durationRing
-	fullRefreshes atomic.Uint64
-	partRefreshes atomic.Uint64
+	mu           sync.Mutex
+	ingestRecent *int64Ring
+	rankLagNs    *int64Ring
 }
 
 func newLatencyMetrics(window int) *latencyMetrics {
-	m := &latencyMetrics{
-		topkAny: newDurationRing(window),
+	if window < 16 {
+		window = 16
 	}
-	m.startedNs.Store(time.Now().UnixNano())
+	m := &latencyMetrics{
+		ingestRecent: newInt64Ring(window),
+		rankLagNs:    newInt64Ring(window),
+	}
 	return m
 }
 
@@ -99,64 +82,104 @@ func (m *latencyMetrics) observeIngest(now time.Time) {
 		now = time.Now()
 	}
 	nowNs := now.UnixNano()
-	m.firstIngestNs.CompareAndSwap(0, nowNs)
-	m.lastIngestNs.Store(nowNs)
 	m.ingestedRecords.Add(1)
+	m.lastIngestNs.Store(nowNs)
+	m.mu.Lock()
+	m.ingestRecent.add(nowNs)
+	m.mu.Unlock()
 }
 
-func (m *latencyMetrics) observeTopKRefresh(d time.Duration, didFull bool) {
+func (m *latencyMetrics) observeTopKRefresh(now time.Time) {
 	if !m.isEnabled() {
 		return
 	}
-	m.topkAny.add(d)
-	if didFull {
-		m.fullRefreshes.Add(1)
-		return
+	if now.IsZero() {
+		now = time.Now()
 	}
-	m.partRefreshes.Add(1)
+	nowNs := now.UnixNano()
+	lastIngestNs := m.lastIngestNs.Load()
+	lagNs := int64(0)
+	if lastIngestNs > 0 && nowNs > lastIngestNs {
+		lagNs = nowNs - lastIngestNs
+	}
+	m.mu.Lock()
+	m.rankLagNs.add(lagNs)
+	m.mu.Unlock()
 }
 
 type snapshot struct {
-	started       time.Time
-	records       uint64
-	avgRps        uint64
-	fullRefreshes uint64
-	partRefreshes uint64
-	topkLatency   durationStats
+	records        uint64
+	ingestRps      uint64
+	ingestSamples  int
+	ingestLag      time.Duration
+	rankLagP95     time.Duration
+	rankLagSamples int
+}
+
+func recentRate(oldest, newest int64, n int) uint64 {
+	if n <= 1 || newest <= oldest {
+		return 0
+	}
+	dt := time.Duration(newest - oldest)
+	if dt <= 0 {
+		return 0
+	}
+	rate := float64(n-1) / dt.Seconds()
+	if rate <= 0 {
+		return 0
+	}
+	return uint64(rate + 0.5)
 }
 
 func (m *latencyMetrics) snapshot() snapshot {
 	if !m.isEnabled() {
 		return snapshot{}
 	}
-	startedNs := m.startedNs.Load()
-	started := time.Time{}
-	if startedNs != 0 {
-		started = time.Unix(0, startedNs)
-	}
 
 	records := m.ingestedRecords.Load()
-
 	lastIngestNs := m.lastIngestNs.Load()
 
-	avgRps := uint64(0)
-	firstIngestNs := m.firstIngestNs.Load()
-	if firstIngestNs != 0 && lastIngestNs != 0 && lastIngestNs > firstIngestNs {
-		active := time.Duration(lastIngestNs - firstIngestNs)
-		if active > 0 {
-			avg := float64(records) / active.Seconds()
-			if avg < 0 {
-				avg = 0
-			}
-			avgRps = uint64(avg + 0.5)
+	m.mu.Lock()
+	oldest, newest, ingestN := m.ingestRecent.snapshot()
+	rankLagP95, rankLagN := percentile95Duration(m.rankLagNs)
+	m.mu.Unlock()
+	ingestLag := time.Duration(0)
+	if lastIngestNs > 0 {
+		nowNs := time.Now().UnixNano()
+		if nowNs > lastIngestNs {
+			ingestLag = time.Duration(nowNs - lastIngestNs)
 		}
 	}
+
 	return snapshot{
-		started:       started,
-		records:       records,
-		avgRps:        avgRps,
-		fullRefreshes: m.fullRefreshes.Load(),
-		partRefreshes: m.partRefreshes.Load(),
-		topkLatency:   m.topkAny.snapshot(),
+		records:        records,
+		ingestRps:      recentRate(oldest, newest, ingestN),
+		ingestSamples:  ingestN,
+		ingestLag:      ingestLag,
+		rankLagP95:     rankLagP95,
+		rankLagSamples: rankLagN,
 	}
+}
+
+func percentile95Duration(r *int64Ring) (time.Duration, int) {
+	if r == nil || r.count == 0 {
+		return 0, 0
+	}
+	vals := make([]int64, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		idx := r.idx - r.count + i
+		for idx < 0 {
+			idx += len(r.buf)
+		}
+		vals = append(vals, r.buf[idx%len(r.buf)])
+	}
+	sort.Slice(vals, func(i, j int) bool { return vals[i] < vals[j] })
+	pos := int(0.95 * float64(len(vals)-1))
+	if pos < 0 {
+		pos = 0
+	}
+	if pos >= len(vals) {
+		pos = len(vals) - 1
+	}
+	return time.Duration(vals[pos]), len(vals)
 }

@@ -138,8 +138,8 @@ func main() {
 
 	flag.BoolVar(&config.SearchEnabled, "search", config.SearchEnabled, "Enable search/filtering in the leaderboard list")
 	flag.DurationVar(&config.FullRefresh, "full-refresh", config.FullRefresh, "How often to do a full Top-K refresh (0 = always)")
-	flag.IntVar(&config.PartialSize, "partial-size", config.PartialSize, "How many items to partially refresh/sort per tick (0 = use visible items)")
-	flag.BoolVar(&config.StatsEnabled, "stats", config.StatsEnabled, "Show simple performance stats (avg/max) for refresh operations")
+	flag.IntVar(&config.PartialSize, "partial-size", config.PartialSize, "How many items to partially refresh/sort per tick (0 = auto budget, about half of K)")
+	flag.BoolVar(&config.StatsEnabled, "stats", config.StatsEnabled, "Show runtime performance stats")
 	flag.IntVar(&config.StatsWindow, "stats-window", config.StatsWindow, "Number of recent samples kept per metric")
 	flag.BoolVar(&config.AltScreen, "alt-screen", config.AltScreen, "Use the terminal alternate screen buffer (recommended inside IDE terminals)")
 
@@ -241,7 +241,9 @@ func validateAndNormalizeConfig() error {
 }
 
 type model struct {
-	width, height int
+	width, height  int
+	leftPaneWidth  int
+	rightPaneWidth int
 
 	track    bool
 	logScale atomic.Bool
@@ -320,6 +322,7 @@ func newModel(sketch *sliding.Sketch) *model {
 		ranker:         ranker,
 		metrics:        metrics,
 	}
+	m.leftPaneWidth, m.rightPaneWidth = computePaneWidths(defaultWidth, config.ViewSplit)
 	m.pauseCond = sync.NewCond(&m.pauseMu)
 	// Default: advance time in real-time (stdin has no timestamps).
 	// Timestamped modes (-json with timestamps, -access-log) will enable this.
@@ -332,8 +335,21 @@ func newModel(sketch *sliding.Sketch) *model {
 	return m
 }
 
-func (m *model) leftWidth() int  { return m.width * config.ViewSplit / 100 }
-func (m *model) rightWidth() int { return m.width * (100 - config.ViewSplit) / 100 }
+func (m *model) leftWidth() int {
+	if m.leftPaneWidth > 0 {
+		return m.leftPaneWidth
+	}
+	left, _ := computePaneWidths(m.width, config.ViewSplit)
+	return left
+}
+
+func (m *model) rightWidth() int {
+	if m.rightPaneWidth > 0 {
+		return m.rightPaneWidth
+	}
+	_, right := computePaneWidths(m.width, config.ViewSplit)
+	return right
+}
 
 func (m *model) readAndCountInput() tui.Cmd {
 	return func() tui.Msg {
@@ -347,7 +363,8 @@ func (m *model) readAndCountInput() tui.Cmd {
 		defer func() { _ = r.Close() }()
 		switch {
 		case config.AccessLog:
-			m.timestampsFromData.Store(true)
+			// Stay in realtime-tick mode until we see a valid timestamp.
+			m.timestampsFromData.Store(false)
 			if err := m.readAccessLogItems(r); err != nil {
 				return errMsg{err}
 			}
@@ -408,17 +425,18 @@ func (m *model) readTextItems(r io.Reader) error {
 }
 
 func (m *model) readJSONItems(r io.Reader) error {
-	var item struct {
-		Item      string `json:"item"`
-		Count     int    `json:"count"`
-		Timestamp any    `json:"timestamp"`
-	}
 	dec := json.NewDecoder(bufio.NewReader(r))
 	var last time.Time
 	var prevEvent time.Time
 	useEventTime := false
 	n := 0
 	for {
+		item := struct {
+			Item      string `json:"item"`
+			Count     int    `json:"count"`
+			Timestamp any    `json:"timestamp"`
+		}{}
+
 		m.waitIfPaused()
 		if config.MaxLines > 0 && n >= config.MaxLines {
 			return nil
@@ -494,6 +512,7 @@ func (m *model) readAccessLogItems(r io.Reader) error {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var last time.Time
 	var prevEvent time.Time
+	useEventTime := false
 	n := 0
 	for scanner.Scan() {
 		m.waitIfPaused()
@@ -512,6 +531,10 @@ func (m *model) readAccessLogItems(r io.Reader) error {
 
 		eventTime, err := time.Parse(config.TimestampLayout, ts)
 		if err == nil && !eventTime.IsZero() {
+			if !useEventTime {
+				useEventTime = true
+				m.timestampsFromData.Store(true)
+			}
 			if config.Replay && !prevEvent.IsZero() {
 				sleep := time.Duration(float64(eventTime.Sub(prevEvent)) / config.ReplaySpeed)
 				if sleep > 0 {
@@ -526,6 +549,8 @@ func (m *model) readAccessLogItems(r io.Reader) error {
 			m.mu.Lock()
 			m.latestTick = last
 			m.mu.Unlock()
+		} else if config.Replay {
+			return fmt.Errorf("replay enabled but access-log record has missing/invalid timestamp")
 		}
 
 		now := time.Now()
@@ -622,11 +647,17 @@ func (m *model) Update(msg tui.Msg) (tui.Model, tui.Cmd) {
 		m.mu.Unlock()
 		return m, nil
 	case ItemCountsTickMsg:
+		if m.isPaused() {
+			return m, doItemCountsTick()
+		}
 		m.updateListItemCountsFromSketch()
 		m.list.Update(msg)
 		cmdList := m.updateList(msg)
 		return m, tui.Batch(cmdList, doItemCountsTick())
 	case ItemsTickMsg:
+		if m.isPaused() {
+			return m, doItemsTick()
+		}
 		m.updateTopKIncremental()
 		cmdList := m.updateList(msg)
 		return m, tui.Batch(cmdList, doItemsTick())
@@ -635,25 +666,31 @@ func (m *model) Update(msg tui.Msg) (tui.Model, tui.Cmd) {
 		return m, tui.Batch(cmdPlot, doPlotTick())
 	case tui.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.leftPaneWidth, m.rightPaneWidth = computePaneWidths(m.width, config.ViewSplit)
 		statsLines := 0
 		if config.StatsEnabled {
-			statsLines = 4
+			// title + 6 metric lines
+			statsLines = 7
 		}
 		helpLines := 1
 		bottomLines := statsLines + helpLines
 		available := m.height - bottomLines
 		available = max(1, available)
 
-		m.list.SetSize(m.leftWidth(), available)
+		leftW := max(1, m.leftWidth())
+		rightW := max(1, m.rightWidth())
+
+		m.list.SetSize(leftW, available)
 		m.list.Styles.Title = styles.NewStyle()
 		m.list.Styles.PaginationStyle = styles.NewStyle()
 		m.list.Styles.HelpStyle = styles.NewStyle()
-		m.listStyle = styles.NewStyle().Width(m.leftWidth()).Height(available)
+		m.listStyle = styles.NewStyle().Width(leftW).Height(available)
 
 		// Right side is: plot canvas + 1 label line, wrapped in a border (adds 2 lines).
 		plotHeight := available - 3
 		plotHeight = max(1, plotHeight)
-		m.resizePlot(m.rightWidth()-2, plotHeight)
+		plotWidth := max(1, rightW-2)
+		m.resizePlot(plotWidth, plotHeight)
 		return m, nil
 	case tui.KeyMsg:
 		switch {
@@ -714,21 +751,26 @@ func (m *model) waitIfPaused() {
 
 func (m *model) updateListItemCountsFromSketch() {
 	m.mu.Lock()
-	for i := range m.listItems {
-		item := &m.listItems[i]
-		m.sketchMu.Lock()
-		item.Count = m.sketch.Count(item.Item)
-		m.sketchMu.Unlock()
+	items := make([]heap.Item, len(m.listItems))
+	copy(items, m.listItems)
+	m.mu.Unlock()
+
+	m.sketchMu.Lock()
+	for i := range items {
+		items[i].Count = m.sketch.Count(items[i].Item)
 	}
+	m.sketchMu.Unlock()
+
+	m.mu.Lock()
+	m.listItems = items
 	m.mu.Unlock()
 }
 
 func (m *model) updateTopKIncremental() {
 	start := time.Now()
-	visible := m.list.Height()
-	items, didFull := m.ranker.Refresh(
+	items, _ := m.ranker.Refresh(
 		start,
-		visible,
+		0,
 		func() []heap.Item {
 			m.sketchMu.Lock()
 			s := m.sketch.SortedSlice()
@@ -743,8 +785,7 @@ func (m *model) updateTopKIncremental() {
 			m.sketchMu.Unlock()
 		},
 	)
-	m.metrics.observeTopKRefresh(time.Since(start), didFull)
-
+	m.metrics.observeTopKRefresh(time.Now())
 	m.mu.Lock()
 	m.listItems = items
 	m.mu.Unlock()
@@ -801,32 +842,26 @@ func (m *model) updatePlot(_ tui.Msg) tui.Cmd {
 		highlight, dim = plot.Black, plot.LightGray
 	}
 
-	if len(m.listItems) == 0 {
-		return nil
-	}
-
 	m.mu.Lock()
 	selected := m.list.Index()
-	items := m.listItems
+	items := make([]heap.Item, len(m.listItems))
+	copy(items, m.listItems)
 	m.mu.Unlock()
+	if len(items) == 0 {
+		return nil
+	}
 
 	for i := range m.plotData {
 		m.plotLineColors[i] = dim
 	}
+	m.sketchMu.Lock()
 	for i := range items {
 		series := m.plotData[i]
 		item := items[(1+selected+i)%len(items)]
 
-		for j := range series {
-			m.sketchMu.Lock()
-			value := float64(m.countAtTimeOffset(item, j))
-			m.sketchMu.Unlock()
-			if logScale {
-				value = math.Log(max(1, value))
-			}
-			series[len(series)-1-j] = value
-		}
+		m.fillSeriesFromSketch(item, series, logScale)
 	}
+	m.sketchMu.Unlock()
 	n := len(items)
 	m.plotLineColors[n] = highlight
 	m.plotLineColors[n-1] = dim
@@ -842,16 +877,36 @@ func (m *model) updatePlot(_ tui.Msg) tui.Cmd {
 	return nil
 }
 
-func (m *model) countAtTimeOffset(item heap.Item, j int) uint32 {
-	var maxCount uint32
-	for k := range m.sketch.Depth {
-		b := m.sketch.Buckets[topk.BucketIndex(item.Item, k, m.sketch.Width)]
-		if b.Fingerprint == item.Fingerprint {
-			c := uint32(b.Counts[(int(b.First)+j)%len(b.Counts)])
-			maxCount = max(maxCount, c)
+func (m *model) fillSeriesFromSketch(item heap.Item, series []float64, logScale bool) {
+	bucketIdx := make([]int, 0, m.sketch.Depth)
+	for k := 0; k < m.sketch.Depth; k++ {
+		idx := topk.BucketIndex(item.Item, k, m.sketch.Width)
+		b := m.sketch.Buckets[idx]
+		if b.Fingerprint == item.Fingerprint && len(b.Counts) > 0 {
+			bucketIdx = append(bucketIdx, idx)
 		}
 	}
-	return maxCount
+
+	if len(bucketIdx) == 0 {
+		for j := range series {
+			series[len(series)-1-j] = 0
+		}
+		return
+	}
+
+	for j := range series {
+		var maxCount uint32
+		for _, idx := range bucketIdx {
+			b := m.sketch.Buckets[idx]
+			c := b.Counts[(int(b.First)+j)%len(b.Counts)]
+			maxCount = max(maxCount, c)
+		}
+		value := float64(maxCount)
+		if logScale {
+			value = math.Log(max(1, value))
+		}
+		series[len(series)-1-j] = value
+	}
 }
 
 func (m *model) View() string {
@@ -877,18 +932,36 @@ func (m *model) View() string {
 	latestTick := m.latestTick
 	m.mu.Unlock()
 	if !latestTick.IsZero() {
-		w := m.rightWidth() - 3
+		w := m.rightWidth() - 2
 		if w < 0 {
 			w = 0
 		}
 		leftLabel := latestTick.Add(-config.WindowSize).UTC().Format(time.RFC3339)
 		rightLabel := latestTick.UTC().Format(time.RFC3339)
-		spaceCount := (w-len(leftLabel)-len(rightLabel)-1)/2 - len("LIN LOG")/2
-		if spaceCount < 0 {
-			spaceCount = 0
+		minWidth := len(leftLabel) + len(rightLabel) + len("LIN LOG") + 4
+
+		// Fall back to short timestamps when the pane is narrow.
+		if w < minWidth {
+			leftLabel = latestTick.Add(-config.WindowSize).UTC().Format("15:04:05")
+			rightLabel = latestTick.UTC().Format("15:04:05")
+			minWidth = len(leftLabel) + len(rightLabel) + len("LIN LOG") + 4
 		}
-		space := strings.Repeat(" ", spaceCount)
-		labels = " " + leftLabel + space + linLog + space + borderFg.Render(rightLabel)
+		// If still too narrow, show only the scale hint to avoid wrapping.
+		if w < minWidth {
+			labels = " " + linLog
+		} else {
+			spaceTotal := w - (len(leftLabel) + len(rightLabel) + len("LIN LOG"))
+			if spaceTotal < 2 {
+				spaceTotal = 2
+			}
+			leftGap := spaceTotal / 2
+			rightGap := spaceTotal - leftGap
+			labels = leftLabel +
+				strings.Repeat(" ", leftGap) +
+				linLog +
+				strings.Repeat(" ", rightGap) +
+				borderFg.Render(rightLabel)
+		}
 	}
 	right := plotStyle.Render(styles.JoinVertical(styles.Top, plot, labels))
 	view := styles.JoinHorizontal(styles.Top, left, right)
@@ -908,15 +981,43 @@ func (m *model) View() string {
 		if m.isPaused() {
 			title = "PERF STATS (PAUSED)"
 		}
+
+		topItem := "-"
+		var topCount uint32
+		m.mu.Lock()
+		if len(m.listItems) > 0 {
+			topItem = m.listItems[0].Item
+			topCount = m.listItems[0].Count
+		}
+		m.mu.Unlock()
+
+		tracked := "off"
+		if m.track {
+			tracked = "-"
+			selected := m.list.SelectedItem()
+			if selected != nil {
+				if li, ok := selected.(listItem); ok {
+					tracked = fmt.Sprintf("%s (%d)", li.Item.Item, li.Count)
+				}
+			}
+		}
+		lag := "n/a"
+		if snap.records > 0 {
+			if m.isPaused() {
+				lag = "paused"
+			} else {
+				lag = formatMetricDuration(snap.ingestLag)
+			}
+		}
+
 		statsBlock = []string{
 			title,
 			fmt.Sprintf("records: %d", snap.records),
-			fmt.Sprintf("ingest rate (avg): %d rec/s", snap.avgRps),
-			fmt.Sprintf("Top-K refresh latency (last/avg/max, n=%d): %s / %s / %s | refreshes full=%d partial=%d",
-				snap.topkLatency.n,
-				formatMs(snap.topkLatency.last), formatMs(snap.topkLatency.avg), formatMs(snap.topkLatency.max),
-				snap.fullRefreshes, snap.partRefreshes,
-			),
+			fmt.Sprintf("ingest rate: %d rec/s", snap.ingestRps),
+			fmt.Sprintf("pipeline lag p95: %s", formatMetricDuration(snap.rankLagP95)),
+			fmt.Sprintf("data freshness lag: %s", lag),
+			fmt.Sprintf("top-1: %s (%d)", topItem, topCount),
+			fmt.Sprintf("track: %s", tracked),
 		}
 	}
 
@@ -927,22 +1028,6 @@ func (m *model) View() string {
 	}
 	return styles.JoinVertical(styles.Left, view, m.help.View(keys))
 }
-
-func formatMs(d time.Duration) string {
-	if d <= 0 {
-		return "0ns"
-	}
-	if d < time.Microsecond {
-		return fmt.Sprintf("%dns", d.Nanoseconds())
-	}
-	if d < time.Millisecond {
-		us := float64(d) / float64(time.Microsecond)
-		return fmt.Sprintf("%.0fus", us)
-	}
-	ms := float64(d) / float64(time.Millisecond)
-	return fmt.Sprintf("%.3fms", ms)
-}
-
 
 func emptyPlot(m *model) strings.Builder {
 	var sb strings.Builder
@@ -957,6 +1042,47 @@ func emptyPlot(m *model) strings.Builder {
 		sb.WriteRune('\n')
 	}
 	return sb
+}
+
+func formatMetricDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0.000ms"
+	}
+	return fmt.Sprintf("%.3fms", float64(d)/float64(time.Millisecond))
+}
+
+func computePaneWidths(totalWidth int, splitPercent int) (left, right int) {
+	if totalWidth <= 1 {
+		return 1, 1
+	}
+	left = totalWidth * splitPercent / 100
+	if left < 1 {
+		left = 1
+	}
+	if left > totalWidth-1 {
+		left = totalWidth - 1
+	}
+	right = totalWidth - left
+
+	// Keep panes readable when the terminal is wide enough.
+	const minPane = 18
+	if totalWidth >= minPane*2 {
+		if left < minPane {
+			left = minPane
+			right = totalWidth - left
+		}
+		if right < minPane {
+			right = minPane
+			left = totalWidth - right
+		}
+	}
+	if left < 1 {
+		left = 1
+	}
+	if right < 1 {
+		right = 1
+	}
+	return left, right
 }
 
 type listItem struct {
