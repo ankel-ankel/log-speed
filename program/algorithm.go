@@ -1,11 +1,31 @@
 package main
 
 import (
-	"sort"
 	"time"
 
 	"github.com/keilerkonzept/topk/heap"
 )
+
+// insertionSort sorts by count descending, then item ascending.
+// O(k) on nearly-sorted data (after partial count updates).
+func insertionSort(items []heap.Item) {
+	for i := 1; i < len(items); i++ {
+		item := items[i]
+		j := i
+		for j > 0 && less(item, items[j-1]) {
+			items[j] = items[j-1]
+			j--
+		}
+		items[j] = item
+	}
+}
+
+func less(a, b heap.Item) bool {
+	if a.Count != b.Count {
+		return a.Count > b.Count
+	}
+	return a.Item < b.Item
+}
 
 type IncrementalRanker struct {
 	k           int
@@ -75,7 +95,7 @@ func (r *IncrementalRanker) Refresh(now time.Time, budgetItems int, sortedFn fun
 		return cloneItems(r.items), true
 	}
 	if len(r.items) == 0 {
-		return nil, needFull
+		return nil, false
 	}
 
 	limit := len(r.items)
@@ -112,14 +132,7 @@ func (r *IncrementalRanker) Refresh(now time.Time, budgetItems int, sortedFn fun
 		r.partialCursor = (start + limit) % len(r.items)
 	}
 
-	sort.SliceStable(r.items, func(i, j int) bool {
-		li := r.items[i]
-		lj := r.items[j]
-		if li.Count != lj.Count {
-			return li.Count > lj.Count
-		}
-		return li.Item < lj.Item
-	})
+	insertionSort(r.items)
 
 	end := len(r.items)
 	for end > 0 && r.items[end-1].Count == 0 {
