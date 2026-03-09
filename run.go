@@ -44,6 +44,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Clean up stale exe from manual "go build ./program" to avoid confusion.
+	os.Remove("./program.exe")
+
 	build := exec.Command("go", "build", "-mod=vendor", "-o", "./logspeed.exe", "./program")
 	build.Stdout = os.Stdout
 	build.Stderr = os.Stderr
